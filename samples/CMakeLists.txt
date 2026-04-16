@@ -66,6 +66,7 @@ set(S2D_SAMPLES
 	collection/human.cpp
 	collection/human.h
 	collection/sample_contact.cpp
+	collection/sample_energy.cpp
 	collection/sample_joints.cpp
 	collection/sample_far.cpp
 )
