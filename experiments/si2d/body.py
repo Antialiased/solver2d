@@ -17,7 +17,6 @@ class Body2D:
     r0: float
     k: float = 1000.0
     nu: float = 0.3
-    energy_model: str = "snh"  # "snh" or "bower"
 
     static: bool = False
 
@@ -85,10 +84,7 @@ class Body2D:
         return -self.mass * np.dot(gravity, self.c)
 
     def _energy_funcs(self):
-        """Return (psi, pk1, hessian_spd) for the selected energy model."""
-        if self.energy_model == "bower":
-            return (energy.psi_bower, energy.pk1_bower,
-                    energy.hessian_bower, energy.hessian_spd_bower)
+        """Return (psi, pk1, hessian, hessian_spd) for the ARAP + volume energy."""
         return (energy.psi, energy.pk1, energy.hessian, energy.hessian_spd)
 
     def elastic_energy(self):
@@ -148,7 +144,6 @@ def integrate_backward_euler(body, dt, gravity=np.array([0.0, -10.0]),
     mu_l, lam_l = body.lame
     scale = body._energy_scale
     psi_fn, pk1_fn, _, hess_spd_fn = body._energy_funcs()
-    need_det_guard = (body.energy_model == "bower")
 
     def ip_energy(vF):
         F_trial = F_old + dt * vF
@@ -177,10 +172,61 @@ def integrate_backward_euler(body, dt, gravity=np.array([0.0, -10.0]),
         alpha = 1.0
         for _ in range(ls_max):
             vF_trial = vF + alpha * dvF
-            F_trial = F_old + dt * vF_trial
-            if need_det_guard and energy._det2(F_trial) < energy._BOWER_J_FLOOR:
-                alpha *= 0.5
-                continue
+            E_trial = ip_energy(vF_trial)
+            if E_trial <= E_cur + 1e-4 * alpha * directional:
+                break
+            alpha *= 0.5
+
+        vF = vF + alpha * dvF
+        if np.max(np.abs(alpha * dvF)) < 1e-12:
+            break
+
+    body.vF = vF
+    body.F = F_old + dt * body.vF
+
+
+def be_elastic_F(body, dt, max_newton=10, ls_max=20):
+    """Backward Euler for F-DoFs only.  Does not touch c or vc.
+
+    Same Newton + line-search minimisation of the incremental potential as
+    integrate_backward_euler, but only the deformation-gradient part.
+    """
+    if body.static:
+        return
+
+    mu_i = body.mu_inertia
+    F_old = body.F.copy()
+    vF_old = body.vF.copy()
+
+    mu_l, lam_l = body.lame
+    scale = body._energy_scale
+    psi_fn, pk1_fn, _, hess_spd_fn = body._energy_funcs()
+
+    def ip_energy(vF):
+        F_trial = F_old + dt * vF
+        return (0.5 * mu_i * float(np.dot(vF - vF_old, vF - vF_old))
+                + psi_fn(F_trial, mu_l, lam_l) * scale)
+
+    vF = vF_old.copy()
+
+    for _ in range(max_newton):
+        F_cur = F_old + dt * vF
+        f_el = -pk1_fn(F_cur, mu_l, lam_l) * scale
+        H_el = hess_spd_fn(F_cur, mu_l, lam_l) * scale
+
+        residual = mu_i * (vF - vF_old) - dt * f_el
+        A = mu_i * np.eye(4) + dt ** 2 * H_el
+
+        try:
+            dvF = np.linalg.solve(A, -residual)
+        except np.linalg.LinAlgError:
+            break
+
+        E_cur = ip_energy(vF)
+        directional = float(np.dot(residual, dvF))
+        alpha = 1.0
+        for _ in range(ls_max):
+            vF_trial = vF + alpha * dvF
             E_trial = ip_energy(vF_trial)
             if E_trial <= E_cur + 1e-4 * alpha * directional:
                 break

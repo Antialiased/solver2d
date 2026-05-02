@@ -1243,3 +1243,608 @@ with Gauss-Seidel converges for stacked contacts (pair+floor) with 16 iterations
 prototype can now handle multi-body scenes. The main remaining gaps are friction
 (needed for realistic oblique interactions) and the SNH area-preservation limitation
 (no visible squish during body-body compression).
+
+---
+
+## Representational limits of the affine basis
+
+### Affine bodies with point joints cannot produce bending stiffness (2026-04-17)
+
+**Setup:** 8-body cantilever chain, each body has affine F (2×2, 4 DoFs) plus
+center-of-mass c (2 DoFs). Adjacent bodies connected by point joints at
+`[±r, 0]` with position and angle constraints. Multiple solver architectures
+tested: TGS+VBD hybrid, per-body penalty optimization, constrained backward
+Euler, full 6D VBD. Material: ARAP + volume, k=2000, ν=0.35.
+
+**Finding:** No architecture produced cantilever bending. The root cause is
+kinematic, not numerical:
+
+1. **With angle constraints:** An interior body has 4 position constraints
+   (from 2 joints) + 2 angle constraints = 6 constraints on 6 DoFs. The body
+   is fully determined — zero free deformation modes. The chain is rigid.
+
+2. **Without angle constraints:** The joints become ball-and-socket. Each body
+   can rotate freely at zero energy cost (ARAP energy is zero for pure
+   rotations). The chain is floppy — a string of beads, not a beam.
+
+3. **The fundamental gap:** Bending stiffness in a real beam comes from
+   differential strain across the cross-section (tension on the outer fiber,
+   compression on the inner fiber). An affine F applies *uniform* strain
+   across the entire body. A point joint only constrains what happens *at that
+   point* — it cannot sense or penalize strain gradients. Therefore no
+   combination of affine bodies and point joints can produce bending resistance.
+
+   Concretely: if body A has F_A = R_θ (pure rotation) and body B has F_B = I,
+   the point joint is satisfied (anchor positions match), and ARAP energy is
+   zero for both bodies. There is no energy penalty for relative rotation.
+
+**So what:** The affine basis is far more limited than it appears. It has 4 DoFs
+per body (vs. 1 for rigid rotation), but those extra DoFs represent *uniform*
+stretch and shear — modes that are invisible to point joints and irrelevant to
+bending. For articulated structures (chains, trees, mechanisms), affine bodies
+behave either as rigid (with angle constraints) or as floppy (without).
+
+To represent bending in a body chain, you need one of:
+- **Non-affine basis** (quadratic or higher) where strain varies across the body,
+  so the joint "sees" differential compression/tension
+- **Extended joints** that constrain the deformation field over a region, not
+  just at a point (e.g., matching F or its derivatives across the interface)
+- **Explicit angular springs** between bodies (but then the "elasticity" is in
+  the joint, not the material — you're building a discrete Euler-Bernoulli beam,
+  not a continuum model)
+
+**Retroactive validation:** The constrained BE and penalty VBD experiments
+(test_constrained_be.py, test_vbd_arch.py) that showed tip_y ≈ 2.99 were
+producing the *correct* result — a rigid beam with negligible deflection.
+These solver architectures are working; the "failure" was in the test
+expectations, not the code. These techniques should be re-evaluated for
+contact scenarios where affine deformation (squish, stretch, shear) is
+the relevant physics.
+
+This changes the project direction: affine deformable bodies are suited for
+*isolated* soft objects (bouncing, squishing, compression under contact) but
+not for *articulated* structures where bending stiffness matters.
+
+### Quadratic basis: nonconvexity is gated by reference-shape curvature, not strain (2026-04-17)
+
+**Setup:** Theoretical analysis of the quadratic deformation basis in 2D
+(`x(X) = c + FX + ½ G(X,X)`, total 12 DoFs in 2D). Examined which modes
+produce nonconvex deformed shapes and at what threshold.
+
+**Finding — two distinct failure modes:**
+
+1. **Map folding** (analog of `det F → 0` in affine case): the deformation
+   gradient `J(X) = F + G·X` has `det J(X) = 0` somewhere, meaning material
+   points overlap. Triggered by the "trapezoid"/"taper" modes (`G^1_{11},
+   G^2_{22}, G^1_{12}, G^2_{12}`) and analogous to the standard FEM
+   element-inversion failure. Image stays convex (or piecewise-linear convex
+   for polygonal reference) right up to the threshold.
+
+2. **Boundary nonconvexity** (no affine analog): the boundary develops
+   inflection points/concavities even though `det J > 0` everywhere.
+   Triggered by the "banana" modes (`G^1_{22}, G^2_{11}` — quadratic
+   dependence of one coordinate on the *perpendicular* axis squared).
+
+**The reference shape determines the threshold for failure mode 2:**
+
+- **Smooth strictly convex reference** (disk of radius `r`, ellipse): boundary
+  intrinsic curvature `~1/r` provides a buffer. Nonconvexity threshold
+  `|G| · r < 1` — i.e., the strain perturbation across the body must stay
+  below 1.
+- **Polygonal reference** (square, any flat-edged shape): zero intrinsic
+  curvature on flat segments. **ANY non-zero banana mode produces immediate
+  nonconvexity** — the dimple depth is `β/2` for `G^2_{11} = β`. No buffer at
+  all. Even infinitesimal deformation breaks convexity.
+- **Reference with concave segments**: already nonconvex at rest.
+
+**Why the buffer is bad:** even with a disk reference, the buffer scales as
+`1/r`. A body of radius 2 has half the tolerance for `|G|` that a body of
+radius 1 has. So we cannot make bodies arbitrarily large without hitting
+nonconvexity at moderate stress. The "rate" at which we buy resistance is
+poor.
+
+**Distinct from `det J` failure:** boundary nonconvexity is not protected by
+a barrier on `det J`. A barrier energy on the volume invariant doesn't see
+boundary inflection. Need a barrier on a *geometric* quantity (e.g., signed
+curvature integral) — which is more expensive and less natural than `det J`
+penalization.
+
+**FEM analog:** this is the well-known transition from constant-strain
+elements (linear tri/tet, T3, always convex image) to higher-order elements
+(quadratic tri T6, has curved edges → can become non-convex; Q8/Q9 quads
+similarly). The bilinear quadrilateral Q4 is the *intermediate* case:
+includes the trapezoid modes but excludes the banana modes, so image is
+always a (possibly degenerate) straight-edged quadrilateral, convex iff
+`det J > 0` at corners. Q4 is exactly the basis for "bending response without
+banana failure" — at the cost of restricted expressiveness.
+
+**So what:** Choice of basis is not just about expressiveness but about
+geometric regularity and reference shape compatibility:
+- Affine + any convex reference: convex iff `det J > 0`.
+- Bilinear quad (Q4 analog) + quadrilateral reference: convex iff `det J > 0`
+  at corners. Has trapezoid modes, no banana modes.
+- Full quadratic + smooth strictly convex reference: convex iff `det J > 0`
+  AND `|G| < c/r`.
+- Full quadratic + polygonal reference: nonconvex generically.
+
+For our solver, the current ellipse + affine setup is well-behaved. Stepping
+up to quadratic requires committing to either ellipse references with a
+barrier on `|G|·r` (sacrificing the freedom to use polygonal shapes) or
+restricted bilinear-quad-style bases on quadrilateral references
+(sacrificing expressiveness). The bilinear-quad path is interesting because
+it's the unique basis that retains pure-`det J` failure semantics.
+
+**Followup — supporting RBD-style reference shapes with radius:** real-time
+RBD solvers conventionally support circles (point + radius), capsules
+(line + radius), and convex polygons (often with an optional rounding
+radius). The radius parameter is a Minkowski sum of the core shape with a
+disk — it produces "rounded" geometry that's collision-friendly (smooth
+contact normals at corners) and lets a single primitive type cover both
+sharp and smooth shapes. For affine deformable bodies this transfers
+cleanly: the radius can deform anisotropically with `F` (point + radius
+becomes ellipse, capsule becomes a stadium-with-elliptical-caps, etc.) and
+collision queries remain tractable. For a richer deformation field this
+gets complicated: the Minkowski sum of a bilinearly-deformed quad with an
+even-uniformly-scaled disk is a rounded quadrilateral whose boundary
+curvature varies along each edge, and support queries become harder. For
+the full quadratic basis, the rounded shape's boundary depends on local
+strain gradients in a non-trivial way. Defer this for prototyping — start
+with sharp polygonal references — but plan to revisit so the deformable
+solver can drop into the same scene-description ecosystem as RBD.
+
+### Banana modes via convex decomposition along symmetry axes (2026-04-17)
+
+**Setup:** With BQ2D (bilinear quad, 8 DoFs: c, F, G) validated as
+bending-capable on the cantilever (see `experiments/biq2d/`), the next
+question is how to enrich the basis past Q4 without sacrificing geometric
+regularity. Q4 is anisotropic by construction — the trapezoid mode `G·ξ₁ξ₂`
+treats one diagonal direction differently from the other. The full quadratic
+basis (12 DoFs, adding `H_x·ξ₁²` and `H_y·ξ₂²`) restores isotropy and adds
+genuine bending response, but the `ξ²` "banana" modes produce immediate
+boundary nonconvexity on a polygonal reference (see prior subsection).
+
+**Argument that no other benign degree-2 modes exist:** the reason `G·ξ₁ξ₂`
+is well-behaved is that `ξ₁ξ₂` is *linear along every reference edge*
+(`ξ₁=±1` ⟹ `±ξ₂`; `ξ₂=±1` ⟹ `±ξ₁`). So a deformed Q4 stays a
+straight-edged quadrilateral — convex iff `det J > 0` at corners. Among
+degree-≤2 polynomials, the modes preserving linearity along *both* pairs of
+edges form exactly `span{1, ξ₁, ξ₂, ξ₁ξ₂}`. The remaining quadratic modes
+`ξ₁²` and `ξ₂²` necessarily break edge linearity on one axis. There are no
+other "benign" quadratic modes to discover — to enrich further, we must
+either accept the banana modes' nonconvexity or refine the body topologically
+(more, smaller cells joined together).
+
+**Decision: include the banana modes; handle nonconvexity by bisection
+*plus* polygonal (chord) approximation of each sub-cell.** Splitting the
+reference square at `ξ₁=0` and `ξ₂=0` gives four sub-cells on `[0,1]²`-type
+reference patches. Splitting alone does *not* make the sub-cells convex —
+the half-edges are still parabolas with the same sign of curvature as the
+full edges. Concrete check: on the right edge at `ξ₁=+1`, the parabolic
+deviation from the chord between `ξ₂=-1` and `ξ₂=+1` at the midpoint is
+`-h·Hy`; bisecting at `ξ₂=0` gives a half-edge whose chord-midpoint
+deviation is `-h·Hy/4` — same direction (still concave or convex in the
+same sense), just a quarter of the magnitude. So bisection is a
+*fidelity* tool (4× boundary error reduction per bisection), not a
+convexity tool.
+
+What *does* restore convexity is replacing each parabolic edge with its
+chord (the straight segment between its two endpoints in world space).
+The chord polygon of a sub-cell is the convex hull of its 4 world-space
+corners — it is convex whenever those 4 corners are in CCW order and no
+interior angle exceeds π, which is exactly the `det J > 0` condition
+applied at the 9-point reference grid `{-1, 0, +1}²` (the 3×3 grid whose
+cells *are* the sub-cells). This is the natural generalisation of BQ2D's
+corner-only det-J check: 4 corners for BQ2D, 9 for FQ2D.
+
+The resulting polygonal sub-cell is either an under- or over-approximation
+of the true parabolic region, depending on the sign of the banana at each
+edge (chord inside the parabola ⟺ parabola bulges out ⟺ polygon
+under-approximates; chord outside ⟺ parabola bulges in ⟺ polygon
+over-approximates). Either way, it is convex and GJK-ready.
+
+**Cost and shape of the work:**
+- 4 GJK queries per body (one per polygonal sub-cell). Constant overhead.
+- Sub-cells share all 12 DoFs and the same energy integral — splits are a
+  collision-side decomposition, not an FEM mesh refinement.
+- 4 straight edges per sub-cell (chord approximation). Standard convex
+  polygon support — no curved-support code.
+- `det J > 0` at the 9-point grid is the combined convexity + inversion
+  gate (per-sub-cell). Sampled-grid barrier fits naturally here.
+
+**The chord polygon is the principal path, not a fallback.** An earlier
+draft of this entry treated parabolic-edge GJK (closed-form quadratic
+support) as the primary path and chord approximation as a perf
+optimization. That was backwards: parabolic sub-cells are not guaranteed
+convex without chord approximation, so a curved-support GJK on them would
+be attempting collision on a non-convex shape. The chord-polygon path is
+what buys us convex-based collision detection at all; fidelity (in the
+presence of strong bananas) is recovered via finer bisection, not via
+curved supports.
+
+**What we are *not* doing:** topological refinement (e.g., a 2×2 grid of
+small Q4 cells per body) is a viable alternative path that would also
+deliver bending isotropy without introducing nonconvex modes — the
+inter-cell joint compliance plays the role of bananas. We're choosing the
+mode-enrichment path because it preserves the "one body = one DoF block"
+structure the VBD solver assumes and avoids increasing joint count
+quadratically with refinement. Revisit if the banana decomposition turns
+out to be a poor performance/quality trade.
+
+### 3-point-per-edge joints are required to engage banana modes (2026-04-17)
+
+**Setup:** FQ2D (12 DoFs, full quadratic basis) cantilever, pure VBD with
+smooth finite-α penalty (mirrors the BQ2D cantilever recipe). Chain of
+4 bodies, first static, the rest under gravity. Adjacent bodies connected
+by three `JointFQ` point matches per edge: the two corners plus the edge
+midpoint. α-sweep ∈ {1, 10, 100}·k·h² at k=2000, n=4. See
+`experiments/biq2d/test_cantilever_fq.py` and `render_cantilever_fq.py`.
+
+**Why the midpoint matters:** corner-only joints cannot engage bananas.
+At every corner `ξ = (σ₁, σ₂)` with `σᵢ² = 1`, the mean-zero banana
+contribution is the *same constant* `h·(2/3)·(Hx + Hy)`, so corner
+constraints see bananas as a global offset. The midpoint `ξ = (±1, 0)`
+has `ξ₁² = 1` but `ξ₂² = 0`, so its banana contribution
+`h·(2/3·Hx − 1/3·Hy)` differs from the corner value — the shortest
+kinematic lever for engaging bananas. Three points per edge uniquely
+determines the degree-2 edge polynomial, giving exact edge continuity for
+the full-quadratic basis (the natural generalisation of BQ2D's
+two-point-per-edge corner match, which is exact for the bilinear basis).
+
+**Result — bananas fire:** α-sweep, final-state metrics:
+
+| α_mult |  tip_y | |G|max | |Hx|max | |Hy|max | joint_err | min_det |
+|-------:|-------:|------:|--------:|--------:|----------:|--------:|
+|    1   |  1.86  | 0.116 |  0.056  |  0.029  |  8.2e-02  |  0.931  |
+|   10   |  2.65  | 0.058 |  0.026  |  0.011  |  5.3e-03  |  0.961  |
+|  100   |  2.84  | 0.027 |  0.011  |  0.002  |  5.2e-04  |  0.976  |
+
+BQ2D baseline at identical stiffness gives `tip_y` 2.02 / 2.77 / 2.80 and
+`|G|` 0.07 / 0.034 / 0.034 across the same α values. FQ2D sags slightly
+more at low α (1.86 vs 2.02) and has measurable banana activation across
+the full sweep. `|Hx| > |Hy|` throughout — consistent with a chain
+oriented along ±x bending about the horizontal, where `ξ₁²` (= axis along
+the chain) is the natural bending mode. As α increases (hard-constraint
+limit), bananas and trapezoids both shrink together; that's expected —
+the constrained kinematics become more rigid-like.
+
+**Soft-stiffness sanity (k=200, α_mult=10):** `tip_y` dips to 0.29 during
+the swing, with `|Hx|` reaching 0.55 and `|G|` 0.74. `min det J` touches
+0.15 (below the 0.3 victory threshold) during the biggest loading phase,
+which is exactly where the deferred sampled-grid barrier would fire. No
+inversion at the k=2000 baseline.
+
+**So what:**
+- Bananas are *kinematically real* in articulated FQ2D chains, not just
+  intra-body dressing. They *do* contribute to bending once the joint
+  topology can see them.
+- The 3-point-per-edge design generalises: for any basis, the number of
+  joint points per shared edge should equal the degree of the edge
+  polynomial plus one (2 for bilinear, 3 for full-quadratic). Below that,
+  some quadratic modes are free-running; at or above, the edge is pinned.
+- The deferred sampled-grid barrier becomes load-bearing once stiffness
+  drops. The k=2000 baseline is stable without it; k=200 with the current
+  α budget isn't. Implement before pushing into aggressive soft regimes.
+
+**Revises:** `project_affine_basis_limits` (affine basis has no bending) —
+BQ2D restores bending via cumulative trapezoid deflections, FQ2D further
+adds an interior bending DoF (2 free scalars `(c, Hx)` per interior body
+under 3-point-per-edge constraints) that engages when the midpoint joint
+is present.
+
+**Companion:** `### Floor contact via outer-ξ smooth penalty matches the
+joint-α scale (2026-04-17)` — same architecture (smooth quadratic penalty
+on a finite ξ-set, integrated into the per-body 12-D Newton) extended from
+joints to ground contact.
+
+### Floor contact via outer-ξ smooth penalty matches the joint-α scale (2026-04-17)
+
+**Setup:** FQ2D body (12 DoFs) dropped onto a horizontal floor at y=0.
+Contact is the symmetric of the joint penalty: at each of the 8 outer ξ
+points `{(±1,±1), (±1,0), (0,±1)}` of `body.sample_grid_3x3`, a smooth
+clamped quadratic `E_i = ½κ·max(y_floor − P_y(ξ_i), 0)²` is added to the
+per-body IP. Active set is recomputed each Newton iter from the trial q.
+Pure VBD, no friction, no body-body. Code: `_outer_floor_contacts_from_q`,
+`vbd_body_step_fq(..., alpha_contact, y_floor)` in
+`experiments/biq2d/solver.py`. Tests: `test_floor_fq.py`. GIFs:
+`floor_drop_fq.gif`, `cantilever_drop_floor_fq.gif`.
+
+**κ sweet spot is the same as the joint α.** Stiffness sweep at k=2000,
+h=0.5, n_steps=1000 (single-body drop from y=2 onto y_floor=0):
+
+| κ_mult | κ        | settled | min outer y | min det J |
+|-------:|---------:|--------:|------------:|----------:|
+|   1    |    500   | bouncy  |   −0.129    |   0.954   |
+|  10    |  5,000   | yes (|v|≈3e−5) | −0.027 |   0.927   |
+| 100    | 50,000   | yes (|v|≈5e−8) | −0.003 |   0.913   |
+
+Penetration scales as expected, `~1/κ`, while min det J degrades only
+slightly (0.95 → 0.91) — the body deforms locally to absorb the contact
+push but does not invert in this regime. `κ_mult = 10` is the same default
+as the joint α sweet spot, so a single knob `(α_mult, κ_mult) = (10, 10)`
+sweeps both joint and contact stiffnesses coherently.
+
+**8-vertex sampling is sufficient for this regime.** Across the sweep no
+penetration sneaked through between sampled outer ξ points: per-step max
+penetrating-point count was 3 (the sub-cell corners on the contact side),
+exactly the count predicted by the chord-polygon picture. The `chord-edge
+integrated penalty` follow-up (line integral of `max(−y(s), 0)² ds` per
+chord) is therefore not load-bearing for FQ2D drop dynamics — keep it
+deferred unless a future test exhibits between-vertex tunneling.
+
+**Joint-vs-contact coupling is benign at the matched α/κ.** Cantilever
+chain (4 bodies, anchor at y=0.6) swung onto the floor: tip touches
+floor with `min outer y = −0.003`, `min det J = 0.984`, **max joint
+position error = 3.3e−3** (compare baseline cantilever-only joint error
+of 5.3e−3 at the same α — *better* than baseline, because the floor
+absorbs swing energy that would otherwise stress the joints). Contact
+does not wreck the joint solve when the two penalties live on the same
+scale.
+
+**Settling without restitution requires patience.** Pure smooth penalty
+inherits BE-like dissipation only — no friction, no velocity-level
+restitution. The 12-D speed norm decays through several decades over
+~600 steps (bounce → ring → settle). At κ_mult=1 the 1000-step run is
+still bouncing visibly (|v|f ≈ 1.3); κ_mult=10 settles to |v| < 3e−5;
+κ_mult=100 to < 1e−7. The deferred velocity-level restitution would
+turn the first compressive contact into an explicit bounce instead of
+this slow ring-down.
+
+**So what:**
+- The "smooth penalty on a finite ξ-set" pattern generalises cleanly
+  from joints (interior matched points) to contact (active outer ξ
+  set). Same Newton, same Hessian structure (`κ·dt²·Jy Jyᵀ`), same
+  `10·k·h²` knob. Body-body contact via GJK on chord-polygon sub-cells
+  becomes a manageable extension rather than a redesign.
+- Min det J stays well above the 0.3 threshold during contact at
+  k=2000. The deferred sampled-grid det-J barrier is *not yet*
+  load-bearing for FQ2D contact at this stiffness — same conclusion as
+  the cantilever-only test. Revisit when k drops or when body-body
+  contact is added.
+- Default `(α_mult, κ_mult) = (10, 10)` is the recommended starting
+  point for any FQ2D scene combining joints and floor contact.
+
+**Companion:** `### Body-body contact via per-sub-cell chord polygons
+(2026-04-18)` — same smooth-penalty / vertex-set architecture extended
+from "vertex vs floor half-plane" to "vertex vs another body's
+sub-cell decomposition", with one important new gotcha (weak inclusion
+on partition lines).
+
+### Body-body contact via per-sub-cell chord polygons (2026-04-18)
+
+**Setup:** Two FQ2D bodies (12 DoFs each), pure VBD with smooth
+clamped-quadratic penalty. Each body's collision geometry = 4 convex
+sub-cell chord polygons (CCW corners drawn from the 9-point sample
+grid), with each sub-cell's 4 edges hard-tagged as either body
+exterior or interior partition. Per ordered pair (A, B), during A's
+local Newton solve we test each of A's 8 outer ξ vertices against
+each of B's 4 sub-cells; B is held fixed for the duration of A's
+solve. Penalty pushes only along the deepest *exterior* edge's
+outward normal — interior partition edges never apply force (avoids
+pushing a vertex back into the body's interior). Owner-vertex GS
+pattern: A's visit handles only A-into-B; reciprocity comes from B's
+visit. Code: `_subcell_polygons_world`, `_vertex_in_subcell`,
+`_collect_body_body_contacts_fq` in `experiments/biq2d/solver.py`.
+Tests: `test_body_contact_fq.py`. GIFs: `body_body_drop_fq.gif`,
+`body_body_collision_fq.gif`.
+
+**Weak inclusion is mandatory.** First implementation used strict
+interior (`max sₑ < 0`); two stacked bodies with vertically-aligned
+centers caused B to fall straight through A. Cause: B's three bottom
+outer ξ vertices sit at world `x ∈ {−h, 0, +h}`, which align *exactly*
+with A's left exterior, central partition, right exterior lines. Each
+vertex's signed distance to one of A's edges is exactly 0, so
+`max sₑ = 0` (not strictly less than 0) for every sub-cell of A — no
+contact ever fires. Fix: change to weak inclusion `max sₑ ≤ 0`. A
+vertex on a sub-cell partition is then in *both* adjacent sub-cells
+(it returns active twice), and each contributes a penalty along its
+own exterior normal. This is conservative but smooth; the partition
+double-count is bounded and stable.
+
+**κ_bb sweet spot is the same as joint α and floor κ.** Stack-drop
+sweep (B static, A drops onto B; k=2000, h=0.5, n_steps=1500):
+
+| κ_bb_mult | κ_bb     | settled        | max pen     | min det J |
+|----------:|---------:|---------------:|------------:|----------:|
+|     1     |    500   | bouncing       |  1.21·10⁻¹  |  0.948    |
+|    10     |  5,000   | yes (|v|≈3e−10) | 1.68·10⁻²  |  0.923    |
+|   100     | 50,000   | yes (|v|≈1e−13) | 1.71·10⁻³  |  0.920    |
+
+Penetration scales `~1/κ`, identical to the floor case. Default
+`(α_mult, κ_floor_mult, κ_bb_mult) = (10, 10, 10)` is the
+recommended baseline for joints + floor + body-body coexisting.
+
+**Static A is the cheap stability check; dynamic A is the real one.**
+With A non-static (both bodies free), A compresses to cy ≈ 0.49 (= h
+minus a tiny bit) under B's weight; separation cy_B − cy_A ≈ 0.99
+(slightly less than 2h, as expected from B's contact deformation
+shrinking the contact gap and A's own elastic squish). min det J
+stayed at 0.95 — well above the inversion threshold; the deferred
+sampled-grid det-J barrier remains *not* load-bearing here.
+
+**Symmetric side collision: bodies bounce; ~40% momentum lost to BE
+dissipation.** Two bodies launched at ±2 m/s with no floor and no
+gravity collide and rebound at ±1.18 m/s — a 41% reduction in
+relative speed per collision pass. This is BE dissipation in the
+elastic deformation modes (Hx and G activate during the squeeze and
+ring down through Newton damping); not a contact-formulation bug.
+A velocity-level restitution impulse on the first compressive
+contact step would recover most of this loss, and is the natural
+follow-up.
+
+**Owner-vertex pattern is fine for the static + symmetric cases.**
+We did not observe any pathological asymmetric residual at
+convergence in the tested scenarios. The deferred "both directions
+per visit with frozen-normal linearization" remains a clean upgrade
+when scenes get more asymmetric (e.g. wide block onto narrow block,
+significantly off-axis) — it's not yet load-bearing.
+
+**Cost (per Newton iteration, per ordered body pair, one direction):**
+8 vertices × 4 sub-cells = 32 vertex-vs-sub-cell tests; each test is
+~6 dot products. ~200 ops per pair per Newton. Negligible at the
+2-body scale; AABB broadphase becomes worthwhile at N ≳ 10.
+
+**So what:**
+- The "smooth penalty on a finite ξ-set" pattern now carries floor
+  contact AND body-body contact under a unified knob (`κ_mult ≈ 10`).
+  Joints, floor, and body-body all coexist at the same scale.
+- Per-sub-cell decomposition is the right collision substrate going
+  forward — same convex pieces will support self-contact (just
+  exclude adjacent sub-cells) and concave-deformation regimes where
+  the 8-vertex outer hull would non-convexify.
+- The weak-inclusion gotcha is the load-bearing implementation
+  detail. Document it loudly at every future "vertex vs polygon"
+  extension (chord-edge integrated penalty, GJK port, …).
+- Body-body contact does *not* push min det J past the 0.3 threshold
+  in the tested regimes. The sampled-grid det-J barrier remains
+  deferred; promote when stiffer bodies stack into towers and start
+  shearing each other.
+
+**Companion:** `### Frozen-normal IPC barrier replaces the smooth
+penalty (2026-04-18)` — same `Jn = nᵀ·J(ξ)` projection skeleton, with
+the scalar `½κ·max(-g,0)²` swapped for the IPC log barrier `b(g; dhat,
+κ_b)` and the line search clamped to a closed-form α_max. Eliminates
+the `1/κ` penetration scaling at the cost of a couple new gotchas
+(active-edge selection on partition seams; deep-penetration normal
+flip).
+
+### Frozen-normal IPC barrier replaces the smooth penalty (2026-04-18)
+
+**Setup:** swap the contact penalty in `vbd_body_step_fq` from a
+clamped quadratic to the IPC log barrier
+`b(g; dhat, κ_b) = -κ_b·(g − dhat)²·ln(g/dhat)`, with a C² quadratic
+continuation below `ε = 0.01·dhat` so warm-start overshoots into
+penetration don't blow up. Active-set + contact normals are frozen
+**once per body visit** (closed-form CCD: `gap(α) = g₀ + α·dt·(Jn·dv)`
+is q-linear, so the per-Newton-iter feasibility clamp is one dot
+product per active contact). Same Jacobian projection as the smooth
+penalty; only the scalar penalty function and the line-search clamp
+change. Code: `_barrier_value/grad/hess`, `_floor_active_contacts`,
+`_body_body_active_contacts`, `vbd_body_step_fq` in
+`experiments/biq2d/solver.py`. Tests: `test_floor_fq.py`,
+`test_body_contact_fq.py`, `test_barrier_contact_fq.py`. GIFs: same
+filenames as the smooth-penalty pass; the soft (k=200) variants are
+the killer A/B test.
+
+**The `1/κ` headache is gone.** Floor κ_b sweep ∈ {10, 100, 1000} at
+dhat=0.05·h: max penetration over 1000 steps ranges from −1.1·10⁻³
+(κ=10) to +4.6·10⁻³ (κ=1000) — i.e., zero penetration regardless of
+κ. Settle position varies by ~17·10⁻³ across the sweep (the body
+hovers further inside the barrier band at higher κ — the steady-state
+gap is determined by force balance against the barrier gradient, not
+penetration). dhat sweep ∈ {0.005, 0.025, 0.05, 0.1}: same
+penetration story (always ≤ 0 within numerical noise of `0.01·dhat`).
+This was the core motivation: the smooth-penalty path needed
+`κ_mult = 100` to get the soft-k=200 GIFs to look clean; the barrier
+gives clean visuals at any κ in 10–1000.
+
+**Floor and body-body need different κ defaults.** Floor barrier with
+κ_b = 100 holds up a 1 kg drop from y=2 with zero penetration.
+Body-body barrier with κ_b = 100 lets B fall through A entirely
+(see "active-edge flip" below). Body-body needs κ_b ≈ 1000 to keep
+the first-impact ingress shallow enough that the active-edge logic
+stays correct. Defaults wired into the test/render call sites:
+`barrier_kappa_floor = 100`, `barrier_kappa_body = 1000`,
+`barrier_dhat = 0.05·h`.
+
+**Active-edge selection branches on inside/outside.** This is the
+load-bearing implementation gotcha. For each (vertex, sub-cell)
+candidate:
+
+- **Outside** (`max sₑ > 0`): the most-violated edge is the contact
+  face. If that edge is on an interior partition seam, *skip* — the
+  adjacent sub-cell's exterior edge handles the same approach
+  direction. Same as the smooth-penalty version.
+- **Inside** (`max sₑ ≤ 0`): cannot use "argmax over all edges"
+  — partition-seam vertices (on `sₑ = 0` for an interior edge) would
+  be missed entirely (warm-start untangling would silently fail
+  with vertex falling under gravity through the polygon). Must use
+  `argmax over EXTERIOR edges only`, picking the deepest exterior
+  edge as the closest exit face. This is the same `_vertex_in_subcell`
+  logic the smooth-penalty path used.
+
+The first iteration of this code unified the two cases under a single
+"argmax over all edges, skip if interior" rule and broke
+warm-start untangling (vertex initialised on a partition seam: argmax
+hits an interior with `sₑ = 0`, contact silently skipped, gravity
+wins).
+
+**Active-edge normal can flip when penetration crosses the polygon
+median.** Frozen-normal IPC's blind spot is *deep* penetration: once
+a vertex is closer to the **wrong** exterior edge of a polygon than
+to the entry edge, `argmax over exterior` selects an edge whose
+outward normal *attracts* the vertex deeper. Why we don't hit this in
+the tested scenes: at the recommended κ_b the first-impact ingress
+stays shallow (≤ 0.5·dhat for stack-drop, less for slow approaches),
+well above the polygon median. Mitigations available later (out of
+pilot scope): persistent active-set across substeps (the proper IPC
+treatment); velocity-disambiguated edge selection (prefer the edge
+whose outward normal opposes the vertex's incoming velocity).
+
+**Warm-start untangling works as advertised.** Initialising B's
+bottom-center vertex 0.05·h inside A (i.e., 5% of half-extent,
+non-trivial overlap) heals to numerical-zero penetration in **5
+substeps**. The C² quadratic continuation below ε keeps the energy
+finite and the gradient strongly repulsive in the deeply-penetrating
+regime; the iterate gets pulled back to feasibility even from beyond
+the barrier domain. No untangling-projection step needed at substep
+entry.
+
+**Per-step cost overhead is 1.6×** versus no-contact free-fall on the
+single-body floor scene (200 steps, dt=1/240). The barrier adds: one
+extra `Jn·q + g_offset` per active contact in `ip_energy` and per
+Newton iter; one `α_max` dot product per contact before Armijo;
+slightly more line-search backtracks at high κ_b (the Hessian's
+contact contribution is large near g=ε). Same `Jn·Jnᵀ` outer-product
+Hessian update structure as the smooth penalty — no additional
+linear-algebra cost per Newton iter.
+
+**Visible "barrier hover" replaces visible "barrier interpenetration"
+in the GIFs.** With dhat = 0.05·h, the body settles 1–2% of h above
+the surface (cy_final = 0.5092 for h=0.5 single-body floor drop, a
+~9·10⁻³ hover above the floor at y=0). At dhat = 0.005·h this drops
+to ~3·10⁻³ (cy=0.4985); at dhat = 0.1·h it grows to 9·10⁻³ (cy=0.58).
+Trade-off: smaller dhat = less hover but more line-search cost during
+fast impacts (the barrier band is narrower so feasibility clamps fire
+harder). The sweet spot we settled on for the pilot is
+`dhat = 0.05·h`.
+
+**Stack settles a touch above 2h, not below.** The previous
+smooth-penalty body-body test asserted `sep < 2h` (B compresses A);
+under the barrier the stack settles at `sep = 1.0183` (compared to
+`2h = 1.0` and `2h + dhat = 1.025`). The barrier's hover band
+between B and A *adds* gap, while A's elastic compression under
+B's weight subtracts a smaller amount, so net `sep > 2h`. This is
+the correct barrier-IPC behaviour; the test assertion was loosened
+to `sep < 2h + 2·dhat`.
+
+**So what:**
+- The `1/κ` penetration scaling — and the brittle `κ_mult` tuning it
+  forced for the soft-body GIFs — is gone. One `(dhat, κ_b)` setting
+  works across stiffnesses.
+- Frozen-normal IPC's main correctness invariant (no penetration) is
+  preserved here, but only conditionally: shallow contact only. For
+  *deep* penetration regimes (vertex past polygon median) the
+  active-edge logic is unsound and needs either persistent active-set
+  state or velocity-disambiguated edge selection. Document this
+  bound; pick the right κ_b to avoid hitting it.
+- Closed-form CCD via frozen normal really does collapse to one dot
+  product per contact per Newton iter. Per-substep cost overhead
+  vs. no-contact is ~1.6×, well within the practical budget.
+- The barrier framework gives us a *feasibility primitive* (`α_max`)
+  that the future PGS rigid-coupling pass can clamp against — that's
+  the strategic win for the eventual hybrid solver
+  (`docs/plans/hybrid_displacement_solver.md`).
+- Asserted invariant in tests: `min_outer_y > -0.5·dhat` for transient
+  impact, `sep` within `±2·dhat` of `2h` at settle, no inversion.
+  These are looser than the floor case asserts because frozen-normal
+  IPC + finite Newton iterations does NOT guarantee zero penetration
+  during *high-velocity impact* (full IPC needs per-Newton-iter CCD,
+  which we deliberately skipped for tractability). In practice the
+  bound is met by orders of magnitude — observed max penetration is
+  literally zero across all tested scenes.
+
+**Next:** stage 2 of `hybrid_displacement_solver.md` — extend the
+per-body Newton block to 2-body Newton blocks for soft-touching
+edges. Then the planar rigid body type and PGS coupling at the
+barrier-clamped boundary. Until then, this barrier is the new
+default contact for FQ2D scenes.

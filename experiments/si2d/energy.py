@@ -1,24 +1,16 @@
-"""Hyperelastic energies for 2D affine bodies.
+"""ARAP + volume hyperelastic energy for 2D affine bodies.
 
-Two models:
+Following the Dynamic Deformables / HOBAK approach (Kim & Ebers, 2020):
+analytic Hessian eigendecomposition via twist/flip modes avoids
+differentiating through the SVD.
 
-1. **SNH** (Stable Neo-Hookean) — Smith, de Goes, Kim (SIGGRAPH 2018)
-   Psi(F) = (mu/2)(Ic - 2) + (lam/2)(J - alpha)^2
-   where alpha = 1 + mu/lam ensures rest stability (PK1 = 0 at F = I).
-   Handles inversion (J < 0) smoothly but has a FINITE energy barrier at J = 0.
-   The Dirichlet term mu*Ic/2 actively drives toward collapse; under large
-   deformation (e.g. cantilever bending) the balance tips and bodies can
-   collapse to zero volume.
+Energy:
+    Psi(F) = mu * sum_i (sigma_i - 1)^2  +  (lam/2) * (J - 1)^2
 
-2. **Bower** (Isochoric Neo-Hookean) — Bower (2009), Bonet & Wood
-   Psi(F) = (mu/2)(Ic/J - 2) + (lam/2)(J - 1)^2
-   Replaces the raw Dirichlet term with its isochoric (volume-neutral) form
-   Ic/J, which goes to infinity as J -> 0+, providing a natural barrier
-   against collapse. No alpha offset needed (stress-free at F = I by
-   construction). Trade-off: undefined for J <= 0 (no inversion support).
+where sigma_i are the (signed) singular values and J = det(F) = sigma_1 * sigma_2.
 
-Both models share the same linearisation at F = I, so lame_from_k applies
-to either.
+The ARAP term penalises deviation from a rotation (||F - R||^2_F).
+The volume term penalises area change ((det(F) - 1)^2).
 
 F is stored as a flat 4-vector: [F11, F12, F21, F22] (row-major).
 """
@@ -35,147 +27,215 @@ def _cofactor2(F):
     return np.array([F[3], -F[2], -F[1], F[0]], dtype=float)
 
 
+def _svd2(F):
+    """Signed SVD of 2x2 matrix from flat F.
+
+    Returns (U, sigma, V) such that F_mat = U @ diag(sigma) @ V^T,
+    where det(U) = det(V) = 1 (proper rotations).
+    sigma[1] may be negative when det(F) < 0 (inverted element).
+    """
+    F_mat = F.reshape(2, 2)
+    U, s, Vt = np.linalg.svd(F_mat)
+    V = Vt.T
+
+    # Ensure both U and V are proper rotations (det = +1).
+    # numpy SVD returns s >= 0 always; to get signed singular values
+    # when det(F) < 0, we flip the last column of U (or V) and negate s[1].
+    if np.linalg.det(U) < 0:
+        U[:, 1] *= -1
+        s[1] *= -1
+    if np.linalg.det(V) < 0:
+        V[:, 1] *= -1
+        s[1] *= -1
+
+    return U, s, V
+
+
+# ── Energy, PK1, Hessian ────────────────────────────────────────────────
+
 def psi(F, mu, lam):
-    """SNH energy. F is flat (4,)."""
-    Ic = float(np.dot(F, F))
-    J = _det2(F)
-    alpha = 1.0 + mu / lam
-    return 0.5 * (mu * (Ic - 2.0) + lam * (J - alpha) ** 2)
+    """ARAP + volume energy.
+
+    Psi = mu * [(s1 - 1)^2 + (s2 - 1)^2]  +  (lam/2) * (J - 1)^2
+    """
+    _, s, _ = _svd2(F)
+    J = s[0] * s[1]
+    return mu * ((s[0] - 1.0) ** 2 + (s[1] - 1.0) ** 2) + 0.5 * lam * (J - 1.0) ** 2
 
 
 def pk1(F, mu, lam):
-    """First Piola-Kirchhoff stress dPsi/dF, returned as flat (4,)."""
+    """First Piola-Kirchhoff stress dPsi/dF, returned as flat (4,).
+
+    P = 2*mu*(F - R) + lam*(J - 1)*cof(F)
+
+    where R = U @ V^T is the closest rotation to F.
+    """
+    U, _, V = _svd2(F)
+    R = (U @ V.T).flatten()
     J = _det2(F)
-    alpha = 1.0 + mu / lam
     cof = _cofactor2(F)
-    return mu * F + lam * (J - alpha) * cof
+    return 2.0 * mu * (F - R) + lam * (J - 1.0) * cof
 
 
 def hessian(F, mu, lam):
     """Analytic Hessian d^2 Psi / dF^2, returned as (4,4).
 
-    H = mu * I_4  +  lam * cof(F) cof(F)^T  +  lam*(J - alpha) * d^2J/dF^2
+    Uses the Dynamic Deformables twist/flip eigendecomposition.
+    The 4x4 Hessian decomposes into:
+      - 2x2 scaling block (stretches along principal directions)
+      - twist mode (relative rotation of U vs V)
+      - flip mode (reflection)
 
-    d^2J/dFij dFkl for a 2x2 matrix has exactly 4 nonzero entries:
-        (0,3) = +1,  (3,0) = +1,  (1,2) = -1,  (2,1) = -1
-    corresponding to d^2(F11*F22 - F12*F21).
+    Each has an analytic eigenvalue; eigenvectors are built from U, V.
     """
-    J = _det2(F)
-    alpha = 1.0 + mu / lam
-    cof = _cofactor2(F)
-    s = lam * (J - alpha)
+    U, s, V = _svd2(F)
+    J = s[0] * s[1]
 
-    H = mu * np.eye(4)
-    H += lam * np.outer(cof, cof)
+    u1, u2 = U[:, 0], U[:, 1]
+    v1, v2 = V[:, 0], V[:, 1]
 
-    # d^2 det / dF^2  (only 4 nonzero entries)
-    H[0, 3] += s
-    H[3, 0] += s
-    H[1, 2] -= s
-    H[2, 1] -= s
+    # Eigenvector matrices (flattened to 4-vectors, row-major)
+    q0 = np.outer(u1, v1).flatten()   # scaling mode 0
+    q1 = np.outer(u2, v2).flatten()   # scaling mode 1
+    # Off-diagonal modes: antisymmetric gets the "flip" eigenvalue,
+    # symmetric gets the "twist" eigenvalue.
+    q_flip = (np.outer(u1, v2) - np.outer(u2, v1)).flatten() / np.sqrt(2)
+    q_twist = (np.outer(u1, v2) + np.outer(u2, v1)).flatten() / np.sqrt(2)
+
+    # --- Scaling block eigenvalues (2x2 sub-problem) ---
+    # ARAP contribution: diag(2mu, 2mu)
+    # Volume contribution: [[lam*s2^2, lam*(2*s1*s2 - 1)],
+    #                        [lam*(2*s1*s2 - 1), lam*s1^2]]
+    A00 = 2.0 * mu + lam * s[1] ** 2
+    A11 = 2.0 * mu + lam * s[0] ** 2
+    A01 = lam * (2.0 * s[0] * s[1] - 1.0)
+
+    tr = A00 + A11
+    det_A = A00 * A11 - A01 ** 2
+    disc = max(0.0, tr ** 2 - 4.0 * det_A)
+    sqrt_disc = np.sqrt(disc)
+    lam_s0 = (tr + sqrt_disc) / 2.0
+    lam_s1 = (tr - sqrt_disc) / 2.0
+
+    # Eigenvectors of scaling sub-block
+    if abs(A01) > 1e-12:
+        e0 = np.array([A01, lam_s0 - A00])
+        e0 /= np.linalg.norm(e0)
+        e1 = np.array([A01, lam_s1 - A00])
+        e1 /= np.linalg.norm(e1)
+    else:
+        e0 = np.array([1.0, 0.0])
+        e1 = np.array([0.0, 1.0])
+        # Correct ordering when diagonal
+        if A00 < A11:
+            lam_s0, lam_s1 = A11, A00
+            e0, e1 = e1, e0
+
+    qs0 = e0[0] * q0 + e0[1] * q1
+    qs1 = e1[0] * q0 + e1[1] * q1
+
+    # --- Twist eigenvalue (symmetric eigenvector) ---
+    # ARAP: 2mu,  Volume: -lam*(J - 1)
+    lam_twist = 2.0 * mu - lam * (J - 1.0)
+
+    # --- Flip eigenvalue (antisymmetric eigenvector) ---
+    # ARAP: 2mu*(s1 + s2 - 2)/(s1 + s2),  Volume: lam*(J - 1)
+    s_sum = s[0] + s[1]
+    if abs(s_sum) > 1e-10:
+        lam_flip = 2.0 * mu * (s_sum - 2.0) / s_sum + lam * (J - 1.0)
+    else:
+        lam_flip = -2.0 * mu + lam * (J - 1.0)
+
+    # Reconstruct full Hessian
+    H = (lam_s0 * np.outer(qs0, qs0) + lam_s1 * np.outer(qs1, qs1)
+         + lam_twist * np.outer(q_twist, q_twist)
+         + lam_flip * np.outer(q_flip, q_flip))
 
     return H
 
 
 def hessian_spd(F, mu, lam):
-    """SPD-projected Hessian (clamp negative eigenvalues to zero)."""
-    H = hessian(F, mu, lam)
-    eigvals, eigvecs = np.linalg.eigh(H)
-    eigvals = np.maximum(eigvals, 0.0)
-    return eigvecs @ np.diag(eigvals) @ eigvecs.T
+    """SPD-projected Hessian (clamp negative eigenvalues to zero).
 
-
-# ── Bower (isochoric Neo-Hookean) ─────────────────────────────────────
-
-_BOWER_J_FLOOR = 1e-6
-
-
-def _bower_safe_J(F):
-    """Return (J, J_safe) where J_safe >= _BOWER_J_FLOOR.
-
-    Joint impulses bypass the energy and can push det(F) negative.
-    The floor keeps the 1/J terms finite; the huge resulting force
-    pulls det(F) back toward 1 at the next backward Euler step.
+    Uses the analytic eigendecomposition — no numerical eigensolver needed.
     """
-    J = _det2(F)
-    return J, max(J, _BOWER_J_FLOOR)
+    U, s, V = _svd2(F)
+    J = s[0] * s[1]
 
+    u1, u2 = U[:, 0], U[:, 1]
+    v1, v2 = V[:, 0], V[:, 1]
 
-def psi_bower(F, mu, lam):
-    """Bower isochoric energy. F is flat (4,).
+    q0 = np.outer(u1, v1).flatten()
+    q1 = np.outer(u2, v2).flatten()
+    q_flip = (np.outer(u1, v2) - np.outer(u2, v1)).flatten() / np.sqrt(2)
+    q_twist = (np.outer(u1, v2) + np.outer(u2, v1)).flatten() / np.sqrt(2)
 
-    Psi = (mu/2)(Ic/J - 2) + (lam/2)(J - 1)^2
-    """
-    Ic = float(np.dot(F, F))
-    J, Js = _bower_safe_J(F)
-    return 0.5 * (mu * (Ic / Js - 2.0) + lam * (J - 1.0) ** 2)
+    # Scaling block
+    A00 = 2.0 * mu + lam * s[1] ** 2
+    A11 = 2.0 * mu + lam * s[0] ** 2
+    A01 = lam * (2.0 * s[0] * s[1] - 1.0)
 
+    tr = A00 + A11
+    det_A = A00 * A11 - A01 ** 2
+    disc = max(0.0, tr ** 2 - 4.0 * det_A)
+    sqrt_disc = np.sqrt(disc)
+    lam_s0 = (tr + sqrt_disc) / 2.0
+    lam_s1 = (tr - sqrt_disc) / 2.0
 
-def pk1_bower(F, mu, lam):
-    """PK1 stress for Bower energy, returned as flat (4,).
+    if abs(A01) > 1e-12:
+        e0 = np.array([A01, lam_s0 - A00])
+        e0 /= np.linalg.norm(e0)
+        e1 = np.array([A01, lam_s1 - A00])
+        e1 /= np.linalg.norm(e1)
+    else:
+        e0 = np.array([1.0, 0.0])
+        e1 = np.array([0.0, 1.0])
+        if A00 < A11:
+            lam_s0, lam_s1 = A11, A00
+            e0, e1 = e1, e0
 
-    P = mu*F/J + (lam*(J-1) - mu*Ic/(2*J^2)) * cof(F)
-    """
-    Ic = float(np.dot(F, F))
-    J, Js = _bower_safe_J(F)
-    cof = _cofactor2(F)
-    return mu * F / Js + (lam * (J - 1.0) - mu * Ic / (2.0 * Js ** 2)) * cof
+    qs0 = e0[0] * q0 + e0[1] * q1
+    qs1 = e1[0] * q0 + e1[1] * q1
 
+    lam_twist = 2.0 * mu - lam * (J - 1.0)
 
-def hessian_bower(F, mu, lam):
-    """Analytic Hessian for Bower energy, returned as (4,4).
+    s_sum = s[0] + s[1]
+    if abs(s_sum) > 1e-10:
+        lam_flip = 2.0 * mu * (s_sum - 2.0) / s_sum + lam * (J - 1.0)
+    else:
+        lam_flip = -2.0 * mu + lam * (J - 1.0)
 
-    H = (mu/J)*I_4
-      - (mu/J^2)*(F x cof + cof x F)
-      + (mu*Ic/J^3 + lam) * cof x cof
-      + (lam*(J-1) - mu*Ic/(2*J^2)) * d^2J/dF^2
-    """
-    Ic = float(np.dot(F, F))
-    J, Js = _bower_safe_J(F)
-    cof = _cofactor2(F)
-
-    H = (mu / Js) * np.eye(4)
-    H -= (mu / Js ** 2) * (np.outer(F, cof) + np.outer(cof, F))
-    H += (mu * Ic / Js ** 3 + lam) * np.outer(cof, cof)
-
-    s = lam * (J - 1.0) - mu * Ic / (2.0 * Js ** 2)
-    H[0, 3] += s
-    H[3, 0] += s
-    H[1, 2] -= s
-    H[2, 1] -= s
+    # Reconstruct with clamped eigenvalues
+    H = np.zeros((4, 4))
+    for lam_i, qi in [(lam_s0, qs0), (lam_s1, qs1),
+                      (lam_twist, q_twist), (lam_flip, q_flip)]:
+        if lam_i > 0.0:
+            H += lam_i * np.outer(qi, qi)
 
     return H
 
 
-def hessian_spd_bower(F, mu, lam):
-    """SPD-projected Hessian for Bower energy."""
-    H = hessian_bower(F, mu, lam)
-    eigvals, eigvecs = np.linalg.eigh(H)
-    eigvals = np.maximum(eigvals, 0.0)
-    return eigvecs @ np.diag(eigvals) @ eigvecs.T
-
-
 def lame_from_k(k, nu=0.3):
-    """Convert a 1D-style stiffness k and Poisson ratio nu to 2D Lame parameters.
+    """Convert stiffness k and Poisson ratio nu to Lame parameters for ARAP + volume.
 
-    We define k so that uniaxial stretch F=diag(1,s) gives d^2 Psi/ds^2 = k
-    at s=1, matching si1d's convention.  For SNH with F=diag(1,s):
-        Ic = 1 + s^2,  J = s
-        Psi = 0.5*[mu*(s^2 - 1) + lam*(s - alpha)^2]
-        d^2 Psi/ds^2 = mu + lam
+    For ARAP + volume with F = diag(1, s):
+        Psi = mu*(s - 1)^2 + (lam/2)*(s - 1)^2
+        d^2 Psi / ds^2 = 2*mu + lam = k
 
-    So k = mu + lam.  With lam = 2*mu*nu / (1 - 2*nu):
-        k = mu * (1 + 2*nu/(1-2*nu)) = mu / (1-2*nu)
-        => mu = k * (1 - 2*nu)
-        => lam = 2 * k * nu
+    With lam = 2*mu*nu / (1 - 2*nu):
+        k = 2*mu + 2*mu*nu/(1-2*nu) = 2*mu*(1-nu)/(1-2*nu)
+        => mu = k*(1-2*nu) / (2*(1-nu))
+        => lam = k*nu / (1-nu)
 
-    For nu=0.3: mu = 0.4*k, lam = 0.6*k.
+    nu = 0: no volume penalty (lam = 0), pure ARAP with mu = k/2.
+    nu -> 0.5: incompressible limit (lam -> inf).
 
-    Note: nu must be > 0 because lam=0 makes alpha = 1 + mu/lam singular.
-    For nearly compressible materials, use a small nu (e.g. 0.01).
+    For nu = 0.3: mu ≈ 0.286*k, lam ≈ 0.429*k.
     """
-    if nu <= 0.0 or nu >= 0.5:
-        raise ValueError(f"Poisson ratio must be in (0, 0.5), got {nu}")
-    mu_l = k * (1.0 - 2.0 * nu)
-    lam_l = 2.0 * k * nu
+    if nu < 0.0 or nu >= 0.5:
+        raise ValueError(f"Poisson ratio must be in [0, 0.5), got {nu}")
+    if nu == 0.0:
+        return k / 2.0, 0.0
+    mu_l = k * (1.0 - 2.0 * nu) / (2.0 * (1.0 - nu))
+    lam_l = k * nu / (1.0 - nu)
     return mu_l, lam_l

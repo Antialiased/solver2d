@@ -25,3 +25,6 @@ New plans go in this folder. Name them by scope
 - [1d_material_richness.md](1d_material_richness.md) — 1D probes that
   extend the material model (COR tuning, asymmetric laws, L-stability
   damping budget).
+- [hybrid_displacement_solver.md](hybrid_displacement_solver.md) —
+  hybrid PGS + 2-body-Newton-block solver with frozen-normal IPC
+  barrier contact. Pilot: in-VBD barrier swap, no rigid coupling yet.

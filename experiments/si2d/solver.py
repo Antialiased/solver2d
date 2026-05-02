@@ -24,6 +24,13 @@ class Params:
     position_correct_F: bool = True  # if False, position pass only corrects center-of-mass
     velocity_couple_F: bool = True  # if False, velocity pass only acts on translational DoFs
     relin: bool = False  # if True, re-solve BE for F after each position impulse
+    # TGS Soft + VBD fields (used by step_tgs)
+    substeps: int = 4
+    relax_iters: int = 1
+    joint_hertz: float = 60.0
+    damping_ratio: float = 10.0
+    contact_hertz: float = 120.0
+    vbd_iters: int = 1
 
 
 @dataclass
@@ -167,13 +174,10 @@ def _relin_be_F(body, dt, impulse_F, newton_iters=10, ls_max=20):
     Uses Newton iterations with backtracking line search to handle barrier
     energies (Bower) where the energy surface is steep near det(F) = 0.
     """
-    from . import energy as energy_mod
-
     mu_i = body.mu_inertia
     mu_l, lam_l = body.lame
     scale = body._energy_scale
     psi_fn, pk1_fn, _, hess_spd_fn = body._energy_funcs()
-    need_det_guard = (body.energy_model == "bower")
 
     F_pre = body._F_pre
     vF_pre = body._vF_pre
@@ -208,10 +212,6 @@ def _relin_be_F(body, dt, impulse_F, newton_iters=10, ls_max=20):
         alpha = 1.0
         for _ in range(ls_max):
             vF_trial = vF + alpha * dvF
-            F_trial = F_pre + dt * vF_trial
-            if need_det_guard and energy_mod._det2(F_trial) < energy_mod._BOWER_J_FLOOR:
-                alpha *= 0.5
-                continue
             E_trial = ip_energy(vF_trial)
             if E_trial <= E_cur + 1e-4 * alpha * directional:
                 break
@@ -644,6 +644,358 @@ def step(state, params):
                     b_b.vc += dlam_t * c.Jt_b[:2] * inv_m_b[:2]
                     if couple_F:
                         b_b.vF += dlam_t * c.Jt_b[2:] * inv_m_b[2:]
+
+    state.time += dt
+    state.step_count += 1
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TGS Soft + VBD joint solve
+# ══════════════════════════════════════════════════════════════════════════
+
+def _prepare_joints_tgs(state, params, h):
+    """Compute TGS Soft coefficients for joint c-DoF constraints."""
+    hertz = min(params.joint_hertz, 0.125 / h)
+    zeta = params.damping_ratio
+    omega = 2.0 * np.pi * hertz
+    c = h * omega * (2.0 * zeta + h * omega)
+    for j in state.joints:
+        j._bias_coeff = omega / (2.0 * zeta + h * omega)
+        j._impulse_coeff = 1.0 / (1.0 + c)
+        j._mass_coeff = c / (1.0 + c)
+        j._lam_x = 0.0
+        j._lam_y = 0.0
+
+
+def _prepare_contacts_tgs(state, params, h):
+    """Compute TGS Soft coefficients for contacts (c-DoFs only)."""
+    hertz = min(params.contact_hertz, 0.25 / h)
+    zeta = params.damping_ratio
+    omega = 2.0 * np.pi * hertz
+    c_coeff = h * omega * (2.0 * zeta + h * omega)
+    bias_coeff = omega / (2.0 * zeta + h * omega)
+    impulse_coeff = 1.0 / (1.0 + c_coeff)
+    mass_coeff = c_coeff / (1.0 + c_coeff)
+
+    bodies = state.bodies
+    for ct in state.contacts:
+        ct._bias_coeff = bias_coeff
+        ct._impulse_coeff = impulse_coeff
+        ct._mass_coeff = mass_coeff
+        ct.lam = 0.0
+        ct.lam_t = 0.0
+
+        # Translational effective mass (c-DoFs only)
+        b_a = bodies[ct.body_a_idx]
+        inv_ma = 0.0 if b_a.static else b_a.inv_mass
+        K_n = inv_ma
+        K_t = inv_ma
+        if ct.J_b is not None and ct.body_b_idx >= 0:
+            b_b = bodies[ct.body_b_idx]
+            inv_mb = 0.0 if b_b.static else b_b.inv_mass
+            K_n += inv_mb
+            K_t += inv_mb
+        ct._K_n_inv = 1.0 / K_n if K_n > 1e-15 else 0.0
+        ct._K_t_inv = 1.0 / K_t if K_t > 1e-15 else 0.0
+
+        # Adjusted separation for substep drift tracking
+        ct._adjusted_sep = ct.gap
+
+
+def _warm_start_tgs(state):
+    """Apply accumulated c-DoF impulses at the start of each substep."""
+    bodies = state.bodies
+    for j in state.joints:
+        ba = bodies[j.body_a_idx]
+        bb = bodies[j.body_b_idx]
+        if not ba.static:
+            ba.vc[0] += j._lam_x * ba.inv_mass
+            ba.vc[1] += j._lam_y * ba.inv_mass
+        if not bb.static:
+            bb.vc[0] -= j._lam_x * bb.inv_mass
+            bb.vc[1] -= j._lam_y * bb.inv_mass
+
+    for ct in state.contacts:
+        if ct.lam == 0.0 and ct.lam_t == 0.0:
+            continue
+        ba = bodies[ct.body_a_idx]
+        n = ct.normal
+        if not ba.static:
+            ba.vc += ct.lam * n * ba.inv_mass
+        if ct.body_b_idx >= 0 and ct.J_b is not None:
+            bb = bodies[ct.body_b_idx]
+            if not bb.static:
+                bb.vc -= ct.lam * n * bb.inv_mass
+
+
+def _solve_joint_tgs_vbd(joint, bodies, params, h, use_bias):
+    """Unified TGS + VBD joint solve.
+
+    Solves all 3 constraint rows (Cx, Cy, Cangle) sequentially.
+    Each row uses a compliance-aware effective mass that includes both
+    the translational (mass) and deformational (IP Hessian) contributions:
+        K = J_c M^{-1} J_c^T  +  J_F A^{-1} J_F^T
+    where A = mu_i*I + dt^2*H_spd.
+
+    The impulse is distributed: c-DoFs get J_c/M, F-DoFs get A^{-1} J_F.
+    """
+    ba = bodies[joint.body_a_idx]
+    bb = bodies[joint.body_b_idx]
+    dt = params.dt
+
+    from . import energy as energy_mod
+
+    # ── Precompute per-body IP inverse and residual for F-DoFs ──
+    body_A_inv = [None, None]
+    body_ip_resid = [None, None]
+    for idx, b in enumerate([ba, bb]):
+        if b.static:
+            continue
+        mu_i = b.mu_inertia
+        mu_l, lam_l = b.lame
+        scale = b._energy_scale
+        H_spd = energy_mod.hessian_spd(b.F, mu_l, lam_l) * scale
+        A = mu_i * np.eye(4) + dt ** 2 * H_spd
+        if np.all(np.isfinite(A)):
+            try:
+                body_A_inv[idx] = np.linalg.inv(A)
+            except np.linalg.LinAlgError:
+                continue
+            # IP residual: how far vF is from elastic equilibrium
+            pk1_val = energy_mod.pk1(b.F, mu_l, lam_l) * scale
+            r = mu_i * (b.vF - b._vF_pre) + dt * pk1_val
+            if np.all(np.isfinite(r)):
+                body_ip_resid[idx] = r
+
+    # ── Build constraint rows ──
+    # Reuse existing Jacobian helpers (full 6-DoF Jacobians)
+    C_pos = _joint_position_error(joint, bodies)
+    C_angle = _joint_angle_error(joint, bodies)
+    Jx_a, Jx_b, Jy_a, Jy_b = _joint_pos_jacobians(joint)
+    Ja_angle, Jb_angle = _joint_angle_jacobians(joint, bodies)
+
+    constraints = [
+        (C_pos[0], Jx_a, Jx_b, '_lam_x'),
+        (C_pos[1], Jy_a, Jy_b, '_lam_y'),
+        (C_angle,  Ja_angle, Jb_angle, None),
+    ]
+
+    for C_val, J_a, J_b, lam_attr in constraints:
+        # ── Effective mass: K = sum_i K_c_i + K_F_i ──
+        K = 0.0
+        body_info = []  # per-body: (J_c, J_F, inv_m, A_inv_J_F) or None
+
+        for idx, (b, J_full) in enumerate([(ba, J_a), (bb, J_b)]):
+            if b.static:
+                body_info.append(None)
+                continue
+
+            J_c = J_full[:2]
+            J_F = J_full[2:]
+            inv_m = b.inv_mass
+
+            # c-contribution
+            K += float(np.dot(J_c, J_c)) * inv_m
+
+            # F-contribution (compliance-aware)
+            if body_A_inv[idx] is not None:
+                A_inv_JF = body_A_inv[idx] @ J_F
+                K += float(np.dot(J_F, A_inv_JF))
+                body_info.append((J_c, J_F, inv_m, A_inv_JF))
+            else:
+                inv_mu = b.inv_mu
+                K += float(np.dot(J_F, J_F)) * inv_mu
+                body_info.append((J_c, J_F, inv_m, None))
+
+        if K < 1e-15:
+            continue
+
+        # ── Velocity-level constraint + IP residual ──
+        Cdot = 0.0
+        resid_contrib = 0.0
+        for idx, (b, J_full) in enumerate([(ba, J_a), (bb, J_b)]):
+            if not b.static:
+                Cdot += float(np.dot(J_full, b.v))
+                # IP residual projected onto constraint: J_F @ A^{-1} @ r
+                if body_A_inv[idx] is not None and body_ip_resid[idx] is not None:
+                    J_F = J_full[2:]
+                    A_inv_r = body_A_inv[idx] @ body_ip_resid[idx]
+                    resid_contrib += float(np.dot(J_F, A_inv_r))
+
+        # ── TGS Soft impulse with bias (VBD-corrected RHS) ──
+        lam_accum = getattr(joint, lam_attr) if lam_attr else 0.0
+        rhs = Cdot + resid_contrib
+        if use_bias:
+            bias = joint._bias_coeff * C_val
+            impulse = (-joint._mass_coeff * (rhs + bias) / K
+                       - joint._impulse_coeff * lam_accum)
+        else:
+            impulse = -rhs / K
+
+        if lam_attr:
+            setattr(joint, lam_attr, getattr(joint, lam_attr) + impulse)
+
+        # ── Apply impulse to c-DoFs and F-DoFs ──
+        for idx, (b, J_full) in enumerate([(ba, J_a), (bb, J_b)]):
+            info = body_info[idx]
+            if info is None:
+                continue
+
+            J_c, J_F, inv_m, A_inv_JF = info
+
+            # c-DoFs: standard mass-inverse projection
+            b.vc += impulse * J_c * inv_m
+
+            # F-DoFs: compliance-aware projection
+            if A_inv_JF is not None:
+                b.vF += impulse * A_inv_JF
+            else:
+                b.vF += impulse * J_F * b.inv_mu
+            b.F = b._F_pre + dt * b.vF
+
+
+def _solve_contact_tgs(contact, bodies, h, use_bias):
+    """TGS Soft contact solve (c-DoFs only)."""
+    ba = bodies[contact.body_a_idx]
+    n = contact.normal
+    t = np.array([-n[1], n[0]])  # tangent (right perp)
+
+    inv_ma = 0.0 if ba.static else ba.inv_mass
+    inv_mb = 0.0
+    vb = np.zeros(2)
+    if contact.body_b_idx >= 0 and contact.J_b is not None:
+        bb = bodies[contact.body_b_idx]
+        inv_mb = 0.0 if bb.static else bb.inv_mass
+        vb = bb.vc if not bb.static else np.zeros(2)
+
+    va = ba.vc if not ba.static else np.zeros(2)
+
+    # ── Normal impulse ──
+    vn = float(np.dot(vb - va, n))
+
+    bias = 0.0
+    mass_scale = 1.0
+    impulse_scale = 0.0
+
+    # Compute current separation (using adjusted separation for substep drift)
+    sep = contact._adjusted_sep
+    if sep > 0.0:
+        # Speculative
+        bias = sep / h
+    elif use_bias:
+        bias = max(contact._bias_coeff * sep, -10.0)  # clamp bias velocity
+        mass_scale = contact._mass_coeff
+        impulse_scale = contact._impulse_coeff
+
+    impulse = (-contact._K_n_inv * mass_scale * (vn + bias)
+               - impulse_scale * contact.lam)
+    new_lam = max(contact.lam + impulse, 0.0)
+    impulse = new_lam - contact.lam
+    contact.lam = new_lam
+
+    if not ba.static:
+        ba.vc -= impulse * n * inv_ma / (inv_ma + inv_mb) * (inv_ma + inv_mb)
+        # Simpler: apply full impulse
+        ba.vc -= impulse * n * inv_ma
+    if contact.body_b_idx >= 0 and contact.J_b is not None:
+        bb = bodies[contact.body_b_idx]
+        if not bb.static:
+            bb.vc += impulse * n * inv_mb
+
+    # ── Friction impulse ──
+    if contact.lam > 0 and hasattr(contact, '_K_t_inv'):
+        va = ba.vc if not ba.static else np.zeros(2)
+        vb_f = np.zeros(2)
+        if contact.body_b_idx >= 0 and contact.J_b is not None:
+            bb = bodies[contact.body_b_idx]
+            vb_f = bb.vc if not bb.static else np.zeros(2)
+        vt = float(np.dot(vb_f - va, t))
+
+        impulse_t = -contact._K_t_inv * vt
+        max_friction = 0.5 * contact.lam  # TODO: use params.friction
+        new_lam_t = max(-max_friction, min(contact.lam_t + impulse_t, max_friction))
+        impulse_t = new_lam_t - contact.lam_t
+        contact.lam_t = new_lam_t
+
+        if not ba.static:
+            ba.vc -= impulse_t * t * inv_ma
+        if contact.body_b_idx >= 0 and contact.J_b is not None:
+            bb = bodies[contact.body_b_idx]
+            if not bb.static:
+                bb.vc += impulse_t * t * inv_mb
+
+
+def _solve_all_tgs(state, params, h, use_bias):
+    """One GS sweep over all constraints (forward + backward for joints)."""
+    bodies = state.bodies
+    for j in state.joints:
+        _solve_joint_tgs_vbd(j, bodies, params, h, use_bias)
+    for j in reversed(state.joints):
+        _solve_joint_tgs_vbd(j, bodies, params, h, use_bias)
+    for ct in state.contacts:
+        _solve_contact_tgs(ct, bodies, h, use_bias)
+
+
+def step_tgs(state, params):
+    """TGS Soft step with VBD-style deformable joint solve.
+
+    Pipeline:
+    1. BE integration for F-DoFs (once, full dt) — sets elastic target
+    2. Detect contacts
+    3. Prepare constraints (TGS Soft coefficients)
+    4. Substep loop: gravity → warm-start → solve → integrate positions → relax
+    """
+    bodies = state.bodies
+    dt = params.dt
+    n_sub = params.substeps
+    h = dt / n_sub
+
+    # ── Save start state ──
+    for b in bodies:
+        if b.static:
+            continue
+        b._c_start = b.c.copy()
+        b._F_pre = b.F.copy()
+        b._vF_pre = b.vF.copy()
+
+    # ── BE integration for F-DoFs (once, full dt) ──
+    for b in bodies:
+        body_mod.be_elastic_F(b, dt)
+    # Now vF is the elastic-equilibrium velocity, F = _F_pre + dt*vF.
+    # Save post-BE vF as the "target" the IP gradient measures against.
+    for b in bodies:
+        if not b.static:
+            b._vF_pre = b.vF.copy()
+
+    # ── Detect contacts ──
+    state.contacts = detect_contacts(state)
+
+    # ── Prepare constraints ──
+    _prepare_joints_tgs(state, params, h)
+    _prepare_contacts_tgs(state, params, h)
+
+    # ── Substep loop ──
+    for substep in range(n_sub):
+        # Integrate velocities (gravity on c-DoFs)
+        for b in bodies:
+            if not b.static:
+                b.vc = b.vc + h * params.gravity
+
+        # Warm start (c-DoF impulses)
+        _warm_start_tgs(state)
+
+        # Solve with bias
+        _solve_all_tgs(state, params, h, use_bias=True)
+
+        # Integrate positions
+        for b in bodies:
+            if not b.static:
+                b.c = b.c + h * b.vc
+                b.F = b._F_pre + dt * b.vF  # full-step invariant
+
+        # Relax (solve without bias)
+        for _ in range(params.relax_iters):
+            _solve_all_tgs(state, params, h, use_bias=False)
 
     state.time += dt
     state.step_count += 1
